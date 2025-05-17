@@ -19,7 +19,7 @@ echo 'export JAVA_HOME=/usr/lib/jvm/java-21-amazon-corretto.x86_64/' >> $HOME/.b
 echo "Installing Maven..."
 wget -q https://dlcdn.apache.org/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz
 tar xzf apache-maven-3.9.9-bin.tar.gz >> install.log
-echo 'export PATH=$PATH:$HOME/apache-maven-3.9.9/bin' >> $HOME/.bashrc
+echo 'export PATH=$PATH:$HOME/aws-summit-dsql-workshop-main/apache-maven-3.9.9/bin' >> $HOME/.bashrc
 rm apache-maven-3.9.9-bin.tar.gz
 
 # Download and install Aurora Java SDK
