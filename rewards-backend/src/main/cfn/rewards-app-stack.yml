@@ -1,0 +1,1354 @@
+#
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Aurora DSQL Rewards Points workshop application deployment.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Workshop Variables"
+        Parameters:
+          - CodeBucketName
+          - ClusterEndpoint
+      - Label:
+          default: "Stack Configuration [DO NOT CHANGE]"
+        Parameters:          
+          - FunctionCodeJarS3Key
+          - LayerCodeZipfileS3Key
+      - Label:
+          default: "Aurora DSQL Cluster Configuration [DO NOT CHANGE]"
+        Parameters:
+          - DatabaseName
+          - ClusterReadOnlyUsername
+          - ClusterReadWriteUsername
+      - Label:
+          default: "Application Configuration [DO NOT CHANGE]"
+        Parameters:
+          - ImageBucketPrefix
+
+Parameters:
+  CodeBucketName:
+    Description: "S3 Bucket for Lambda function code"
+    Type: String
+    MinLength: 5
+  FunctionCodeJarS3Key:
+    Description: "S3 key for the JAR file containing code for the project's Lambda functions"
+    Type: String
+    Default: "rewards-points-1.0.jar"
+  LayerCodeZipfileS3Key:
+    Description: "S3 key for the ZIP file containing code for the Lambda layer used int the project's Lambda functions"
+    Type: String
+    Default: "rewards-points-1.0-layer.zip"
+  ClusterEndpoint:
+    Description: "The endpoint of the Aurora DSQL cluster in the region this stack is deployed in.  This is the complete cluster endpoint, not just the cluster ID."
+    Type: String
+    MinLength: 5
+  ClusterReadOnlyUsername:
+    Description: "The name of the PostgreSQL role for read-only operations"
+    Type: String
+    Default: "rewards_ro"
+  ClusterReadWriteUsername:
+    Description: "The name of the PostgreSQL role for read-only operations"
+    Type: String
+    Default: "rewards_rw"
+  DatabaseName:
+    Description: "The name of the rewards database within the Aurora DSQL cluster"
+    Type: String
+    Default: "postgres"
+  ImageBucketPrefix:
+    Description: "S3 path prefix for all image URIs. This should not have a leading or trailing slash."
+    Default: "catalog/images"
+    Type: String
+
+
+Resources:
+  KmsKey:
+    Type: 'AWS::KMS::Key'
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: key-default-1
+        Statement:
+          - Sid: Permissions1
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Permissions2
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Permissions3
+            Effect: Allow
+            Principal:
+              Service: 'sqs.amazonaws.com'
+            Action: 'kms:*'
+            Resource: '*'
+
+  RegistrationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 300
+      KmsMasterKeyId: !Ref KmsKey
+
+  RegisterUsersRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole"
+      Policies:
+        - PolicyName: "AuroraDSQLAccess"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminGetUser
+                  - cognito-idp:AdminSetUserPassword
+                Resource:
+                  - !GetAtt UserPool.Arn
+        - PolicyName: "KmsKeyAccess"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                Resource:
+                  - !GetAtt KmsKey.Arn    
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  RegistrationQueuingRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "AuroraDSQLAccess"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dsql:DbConnectAdmin'
+                  - 'dsql:GetCluster'
+                Resource:
+                  - !Sub "arn:aws:dsql:${AWS::Region}:${AWS::AccountId}:cluster/*"
+              - Effect: Allow
+                Action:
+                  - 'sqs:SendMessage'
+                Resource:
+                  - !GetAtt RegistrationQueue.Arn
+        - PolicyName: "KmsKeyAccess"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kms:GenerateDataKey'
+                  - 'kms:Encrypt'
+                  - 'kms:Decrypt'
+                Resource:
+                  - !GetAtt KmsKey.Arn
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  ClusterReadOnlyRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "AuroraDSQLAccess"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dsql:DbConnect'
+                  - 'dsql:GetCluster'
+                Resource:
+                  - !Sub "arn:aws:dsql:*:${AWS::AccountId}:cluster/*"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  ClusterReadWriteRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "AuroraDSQLAccess"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dsql:DbConnect'
+                  - 'dsql:GetCluster'
+                Resource:
+                  - !Sub "arn:aws:dsql:*:${AWS::AccountId}:cluster/*"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  APIGatewayInvocationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: "Grants API Gateway access to invoke application Lambda functions and push logs"
+      Policies:
+        - PolicyName: "InvokeLambdaFunctions"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource:
+                  - !GetAtt GetPointsBalanceFunction.Arn
+                  - !GetAtt GetCustomerFunction.Arn
+                  - !GetAtt GetCatalogItemFunction.Arn
+                  - !GetAtt GetCatalogFunction.Arn
+                  - !GetAtt GetCategoriesFunction.Arn
+                  - !GetAtt GetPointsTransactionsFunction.Arn
+                  - !GetAtt GetPointsTransactionDetailsFunction.Arn
+                  - !GetAtt GetShoppingCartItemsFunction.Arn
+                  - !GetAtt AddUpdateShoppingCartItemsFunction.Arn
+                  - !GetAtt DeleteShoppingCartItemsFunction.Arn
+                  - !GetAtt ShoppingCartCheckoutFunction.Arn
+        - PolicyName: "APILogging"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "apigateway.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  APILogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/api/${AWS::StackName}'
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt KmsKey.Arn
+
+  API:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Description: "Rewards Points API"
+      Name: !Sub '${AWS::StackName}-api'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowHeaders:
+          - '*'
+        AllowMethods:
+          - GET
+          - POST
+          - DELETE
+          - OPTIONS
+        MaxAge: 28800
+  
+  ProdStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      Description: "Production stage"
+      StageName: rewards
+      ApiId: !Ref API
+      AutoDeploy: True
+      AccessLogSettings:
+        DestinationArn: !GetAtt APILogGroup.Arn
+        Format: '$context.identity.sourceIp,$context.requestTime,$context.httpMethod,$context.path,$context.protocol,$context.status,$context.responseLength,$context.requestId,$context.integrationErrorMessage'
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 100
+
+  #
+  # Lambda Layer
+  #
+  LambdaLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - java21
+      Content:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref LayerCodeZipfileS3Key
+
+  #
+  # Presign catalog images URLs
+  #
+  ImagePresignQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 300
+      KmsMasterKeyId: !Ref KmsKey
+
+  ImagePresignerRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole"
+      Policies:
+        - PolicyName: "AuroraDSQLAccess"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dsql:DbConnect'
+                  - 'dsql:GetCluster'
+                Resource:
+                  - !Sub "arn:aws:dsql:*:${AWS::AccountId}:cluster/*"
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${CodeBucketName}/${ImageBucketPrefix}/*'
+        - PolicyName: "KmsKeyAccess"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kms:GenerateDataKey'
+                  - 'kms:Encrypt'
+                  - 'kms:Decrypt'
+                Resource:
+                  - !GetAtt KmsKey.Arn                  
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  ImagePresignerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: MapDatabaseRoles
+    Properties:
+      Description: "Presigns catalog image URLs"
+      Handler: "software.amazon.dsql.rewards.ImagePresignedUrlGeneratorFunction::handleRequest"
+      Role: !GetAtt ImagePresignerRole.Arn
+      Runtime: java21
+      MemorySize: 1024
+      Timeout: 300
+      Environment:
+        Variables:
+          CLUSTER_ENDPOINT: !Ref ClusterEndpoint
+          DB_USERNAME: !Ref ClusterReadWriteUsername
+          DB_NAME: !Ref DatabaseName
+          IMAGE_BUCKET: !Ref CodeBucketName
+          IMAGE_BASE_KEY: !Ref ImageBucketPrefix
+          PRESIGNED_URL_DURATION_MINUTES: 720
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref FunctionCodeJarS3Key
+      Layers:
+        - !Ref LambdaLayer
+
+  ImagePresignerQueueMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref ImagePresignerFunction
+      BatchSize: 20
+      MaximumBatchingWindowInSeconds: 5
+      EventSourceArn: !GetAtt ImagePresignQueue.Arn
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  SchedulerQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - SQS:SendMessage
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Resource:
+              - !GetAtt ImagePresignQueue.Arn
+      Queues:
+        - !Ref ImagePresignQueue
+
+  ImagePresignerTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Regularly refreshes presigned image URLs"
+      Name: "ImagePresignerJob"
+      State: "ENABLED"
+      ScheduleExpression: "rate(10 hours)"
+      Targets:
+        - Arn: !GetAtt ImagePresignQueue.Arn
+          Id: "ImagePresignerQueue"
+
+  ImagePresignerKickerOfferRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "AuroraDSQLAccess"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sqs:SendMessage'
+                Resource:
+                  - !GetAtt ImagePresignQueue.Arn
+        - PolicyName: "KmsKeyAccess"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kms:GenerateDataKey'
+                  - 'kms:Encrypt'
+                  - 'kms:Decrypt'
+                Resource:
+                  - !GetAtt KmsKey.Arn
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  ImagePresignerKickerOfferFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Triggers image presigning as the stack launches"
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: 1024
+      Timeout: 300
+      Role: !GetAtt ImagePresignerKickerOfferRole.Arn
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref ImagePresignQueue
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import os
+          
+          def handler(event, context):              
+            try:
+              if event['RequestType'] == 'Create':
+                sqs = boto3.client('sqs')
+                sqs.send_message(QueueUrl=os.environ['QUEUE_URL'], MessageBody='GO')
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+            except Exception as e:
+              print(e)
+              reason = f"Exception thrown: {e}"
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=reason)            
+
+  PresignImageUrls:
+    Type: Custom::PrepareImages
+    DependsOn:
+      - PrepareImages
+      - MapDatabaseRoles
+    Properties:
+      ServiceToken: !GetAtt ImagePresignerKickerOfferFunction.Arn
+
+  #
+  # Upload Workshop Studio project images to S3 bucket
+  #
+  ImagePreparationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "S3Access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:GetObject"
+                Resource:
+                  - 'arn:aws:s3:::ws-assets-prod-iad-r-iad-ed304a55c2ca1aee'
+                  - 'arn:aws:s3:::ws-assets-prod-iad-r-iad-ed304a55c2ca1aee/*'
+                  - 'arn:aws:s3:::ws-assets-prod-iad-r-cmh-8d6e9c21a4dec77d'
+                  - 'arn:aws:s3:::ws-assets-prod-iad-r-cmh-8d6e9c21a4dec77d/*'
+              - Effect: "Allow"
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:PutObject"
+                Resource:
+                  - !Sub 'arn:aws:s3:::${CodeBucketName}'
+                  - !Sub 'arn:aws:s3:::${CodeBucketName}/*'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  ImagePreparationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Fetches the images from Workshop Studio and uploads them to "
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: 1024
+      Timeout: 300
+      Role: !GetAtt ImagePreparationRole.Arn
+      EphemeralStorage:
+        Size: 512
+      Environment:
+        Variables:
+          IMAGE_BUCKET: !Ref CodeBucketName
+          S3_KEY_PREFIX: !Ref ImageBucketPrefix
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import os
+          from zipfile import ZipFile
+          
+          def handler(event, context):              
+            try:
+              if event['RequestType'] != 'Create':
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                return
+          
+              target_bucket = os.environ['IMAGE_BUCKET']
+              target_prefix = os.environ['S3_KEY_PREFIX']
+
+              if not target_prefix.endswith('/'):
+                target_prefix += '/'
+          
+              image_zip_key = '2e2ca614-1fa7-4e65-936b-b495eb53d180/product_images.zip'
+          
+              zip_buckets = {
+                'us-east-1': 'ws-assets-prod-iad-r-iad-ed304a55c2ca1aee',
+                'us-east-2': 'ws-assets-prod-iad-r-cmh-8d6e9c21a4dec77d'
+              }
+          
+              current_region = boto3.session.Session().region_name
+          
+              s3 = boto3.client('s3')
+              s3.download_file(zip_buckets[current_region], image_zip_key, '/tmp/images.zip')
+              os.chdir('/tmp')
+              with ZipFile('images.zip') as zip:
+                zip.extractall()
+
+              for filename in os.listdir("/tmp/product_images"):
+                s3.upload_file("/tmp/product_images/" + filename, target_bucket, target_prefix + filename)
+          
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+            except Exception as e:
+              print(e)
+              reason = f"Exception thrown: {e}"
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=reason)            
+
+  PrepareImages:
+    Type: Custom::PrepareImages
+    Properties:
+      ServiceToken: !GetAtt ImagePreparationFunction.Arn
+      
+  #
+  # Map database roles function
+  #
+  MapDatabaseRolesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Maps an Aurora DSQL database role to an IAM role"
+      Handler: "software.amazon.dsql.rewards.cfn.DatabaseRoleLinkerFunction::handleRequest"
+      Role: !GetAtt RegistrationQueuingRole.Arn
+      Runtime: java21
+      MemorySize: 1024
+      Timeout: 300
+      Environment:
+        Variables:
+          CLUSTER_ENDPOINT: !Ref ClusterEndpoint
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref FunctionCodeJarS3Key
+      Layers:
+        - !Ref LambdaLayer
+
+  MapDatabaseRoles:
+    Type: Custom::MapDatabaseRole
+    Properties:
+      ServiceToken: !GetAtt MapDatabaseRolesFunction.Arn
+      ServiceTimeout: 300
+      RoleMaps:
+        - DatabaseRole: !Ref ClusterReadOnlyUsername
+          IamRole: !GetAtt ClusterReadOnlyRole.Arn
+        - DatabaseRole: !Ref ClusterReadWriteUsername
+          IamRole: !GetAtt ClusterReadWriteRole.Arn
+        - DatabaseRole: !Ref ClusterReadWriteUsername
+          IamRole: !GetAtt ImagePresignerRole.Arn
+
+  #
+  # Add users to Cognito from the Aurora DSQL cluster
+  #
+  QueueRewardsUsersForRegistrationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Reads customers from Aurora DSQL and queues them in SQS for registration"
+      Handler: "software.amazon.dsql.rewards.cfn.QueueCustomersForRegistrationFunction::handleRequest"
+      Role: !GetAtt RegistrationQueuingRole.Arn
+      Runtime: java21
+      MemorySize: 1024
+      Timeout: 300
+      Environment:
+        Variables:
+          CLUSTER_ENDPOINT: !Ref ClusterEndpoint
+          DB_USERNAME: admin
+          DB_NAME: !Ref DatabaseName
+          QUEUE_URL: !GetAtt RegistrationQueue.QueueUrl
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref FunctionCodeJarS3Key
+      Layers:
+        - !Ref LambdaLayer
+
+  RegisterQueuedUsersFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Reads customers from SQS queue and registers them in Cognito"
+      Handler: "software.amazon.dsql.rewards.cfn.RegistrationQueueHandler::handleRequest"
+      Role: !GetAtt RegisterUsersRole.Arn
+      Runtime: java21
+      MemorySize: 1024
+      Timeout: 300
+      Environment:
+        Variables:
+          COGNITO_POOL_ID: !GetAtt UserPool.UserPoolId
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref FunctionCodeJarS3Key
+      Layers:
+        - !Ref LambdaLayer
+
+  RegisterQueueMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref RegisterQueuedUsersFunction
+      BatchSize: 20
+      MaximumBatchingWindowInSeconds: 5
+      EventSourceArn: !GetAtt RegistrationQueue.Arn
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+      ScalingConfig:
+        MaximumConcurrency: 5
+      
+  RegisterUsers:
+    Type: Custom::BuildLambdaLayer
+    Properties:
+      ServiceToken: !GetAtt QueueRewardsUsersForRegistrationFunction.Arn
+
+  #
+  # Get Customer
+  #
+  GetCustomerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: MapDatabaseRoles
+    Properties:
+      Description: "Fetches a customer's record"
+      Handler: "software.amazon.dsql.rewards.GetCustomerFunction::handleRequest"
+      Role: !GetAtt ClusterReadOnlyRole.Arn
+      Runtime: java21
+      MemorySize: 1024
+      Timeout: 300
+      Environment:
+        Variables:
+          CLUSTER_ENDPOINT: !Ref ClusterEndpoint
+          DB_USERNAME: !Ref ClusterReadOnlyUsername
+          DB_NAME: !Ref DatabaseName
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref FunctionCodeJarS3Key
+      Layers:
+        - !Ref LambdaLayer
+
+
+  GetCustomerIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref API
+      ConnectionType: INTERNET
+      CredentialsArn: !GetAtt APIGatewayInvocationRole.Arn
+      IntegrationMethod: POST
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetCustomerFunction.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 30000
+
+  #
+  # Get Rewards Points
+  #
+  GetPointsBalanceFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: MapDatabaseRoles
+    Properties:
+      Description: "Fetches the user's current points balance and recent transactions"
+      Handler: "software.amazon.dsql.rewards.GetBalanceFunction::handleRequest"
+      Role: !GetAtt ClusterReadOnlyRole.Arn
+      Runtime: java21
+      MemorySize: 1024
+      Timeout: 300
+      Environment:
+        Variables:
+          CLUSTER_ENDPOINT: !Ref ClusterEndpoint
+          DB_USERNAME: !Ref ClusterReadOnlyUsername
+          DB_NAME: !Ref DatabaseName
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref FunctionCodeJarS3Key
+      Layers:
+        - !Ref LambdaLayer
+
+
+  GetPointsBalanceIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref API
+      ConnectionType: INTERNET
+      CredentialsArn: !GetAtt APIGatewayInvocationRole.Arn
+      IntegrationMethod: POST
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetPointsBalanceFunction.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 30000
+
+  #
+  # Get Points Transactions
+  #
+  GetPointsTransactionsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: MapDatabaseRoles
+    Properties:
+      Description: "Fetches the user's points transactions"
+      Handler: "software.amazon.dsql.rewards.GetTransactionListFunction::handleRequest"
+      Role: !GetAtt ClusterReadOnlyRole.Arn
+      Runtime: java21
+      MemorySize: 1024
+      Timeout: 300
+      Environment:
+        Variables:
+          CLUSTER_ENDPOINT: !Ref ClusterEndpoint
+          DB_USERNAME: !Ref ClusterReadOnlyUsername
+          DB_NAME: !Ref DatabaseName
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref FunctionCodeJarS3Key
+      Layers:
+        - !Ref LambdaLayer
+
+
+  GetPointsTransactionsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref API
+      ConnectionType: INTERNET
+      CredentialsArn: !GetAtt APIGatewayInvocationRole.Arn
+      IntegrationMethod: POST
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetPointsTransactionsFunction.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 30000
+
+  #
+  # Get Points Transaction Details
+  #
+  GetPointsTransactionDetailsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: MapDatabaseRoles
+    Properties:
+      Description: "Fetches the user's points transactions"
+      Handler: "software.amazon.dsql.rewards.GetTransactionDetailsFunction::handleRequest"
+      Role: !GetAtt ClusterReadOnlyRole.Arn
+      Runtime: java21
+      MemorySize: 1024
+      Timeout: 300
+      Environment:
+        Variables:
+          CLUSTER_ENDPOINT: !Ref ClusterEndpoint
+          DB_USERNAME: !Ref ClusterReadOnlyUsername
+          DB_NAME: !Ref DatabaseName
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref FunctionCodeJarS3Key
+      Layers:
+        - !Ref LambdaLayer
+ 
+
+  GetPointsTransactionDetailsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref API
+      ConnectionType: INTERNET
+      CredentialsArn: !GetAtt APIGatewayInvocationRole.Arn
+      IntegrationMethod: POST
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetPointsTransactionDetailsFunction.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 30000      
+
+  #
+  # Get Catalog Item
+  #
+  GetCatalogItemFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: MapDatabaseRoles
+    Properties:
+      Description: "Fetches a catalog item from inventory"
+      Handler: "software.amazon.dsql.rewards.GetCatalogItemFunction::handleRequest"
+      Role: !GetAtt ClusterReadOnlyRole.Arn
+      Runtime: java21
+      MemorySize: 1024
+      Timeout: 300
+      Environment:
+        Variables:
+          CLUSTER_ENDPOINT: !Ref ClusterEndpoint
+          DB_USERNAME: !Ref ClusterReadOnlyUsername
+          DB_NAME: !Ref DatabaseName
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref FunctionCodeJarS3Key
+      Layers:
+        - !Ref LambdaLayer
+
+
+  GetCatalogItemIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref API
+      ConnectionType: INTERNET
+      CredentialsArn: !GetAtt APIGatewayInvocationRole.Arn
+      IntegrationMethod: POST
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetCatalogItemFunction.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 30000
+
+  #
+  # Get Catalog
+  #
+  GetCatalogFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: MapDatabaseRoles
+    Properties:
+      Description: "Fetches all catalog items from inventory, sorted"
+      Handler: "software.amazon.dsql.rewards.GetCatalogItemListFunction::handleRequest"
+      Role: !GetAtt ClusterReadOnlyRole.Arn
+      Runtime: java21
+      MemorySize: 1024
+      Timeout: 300
+      Environment:
+        Variables:
+          CLUSTER_ENDPOINT: !Ref ClusterEndpoint
+          DB_USERNAME: !Ref ClusterReadOnlyUsername
+          DB_NAME: !Ref DatabaseName
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref FunctionCodeJarS3Key
+      Layers:
+        - !Ref LambdaLayer
+
+
+  GetCatalogIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref API
+      ConnectionType: INTERNET
+      CredentialsArn: !GetAtt APIGatewayInvocationRole.Arn
+      IntegrationMethod: POST
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetCatalogFunction.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 30000
+
+  #
+  # Get Catalog Categories
+  #
+  GetCategoriesFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: MapDatabaseRoles
+    Properties:
+      Description: "Fetches all catalog item category types"
+      Handler: "software.amazon.dsql.rewards.GetCategoriesFunction::handleRequest"
+      Role: !GetAtt ClusterReadOnlyRole.Arn
+      Runtime: java21
+      MemorySize: 1024
+      Timeout: 300
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref FunctionCodeJarS3Key
+      Layers:
+        - !Ref LambdaLayer
+
+  GetCategoriesIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref API
+      ConnectionType: INTERNET
+      CredentialsArn: !GetAtt APIGatewayInvocationRole.Arn
+      IntegrationMethod: POST
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetCategoriesFunction.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 30000
+
+  #
+  # Get Shopping Cart Items
+  #
+  GetShoppingCartItemsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: MapDatabaseRoles
+    Properties:
+      Description: "Fetches a customer's record"
+      Handler: "software.amazon.dsql.rewards.GetShoppingCartItemsFunction::handleRequest"
+      Role: !GetAtt ClusterReadOnlyRole.Arn
+      Runtime: java21
+      MemorySize: 1024
+      Timeout: 300
+      Environment:
+        Variables:
+          CLUSTER_ENDPOINT: !Ref ClusterEndpoint
+          DB_USERNAME: !Ref ClusterReadOnlyUsername
+          DB_NAME: !Ref DatabaseName
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref FunctionCodeJarS3Key
+      Layers:
+        - !Ref LambdaLayer
+
+        
+  GetShoppingCartItemsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref API
+      ConnectionType: INTERNET
+      CredentialsArn: !GetAtt APIGatewayInvocationRole.Arn
+      IntegrationMethod: POST
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetShoppingCartItemsFunction.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 30000
+
+  #
+  # Add/Update Shopping Cart Item
+  #
+  AddUpdateShoppingCartItemsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: MapDatabaseRoles
+    Properties:
+      Description: "Fetches a customer's record"
+      Handler: "software.amazon.dsql.rewards.AddUpdateShoppingCartItemFunction::handleRequest"
+      Role: !GetAtt ClusterReadWriteRole.Arn
+      Runtime: java21
+      MemorySize: 1024
+      Timeout: 300
+      Environment:
+        Variables:
+          CLUSTER_ENDPOINT: !Ref ClusterEndpoint
+          DB_USERNAME: !Ref ClusterReadWriteUsername
+          DB_NAME: !Ref DatabaseName
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref FunctionCodeJarS3Key
+      Layers:
+        - !Ref LambdaLayer
+
+
+  AddUpdateShoppingCartItemsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref API
+      ConnectionType: INTERNET
+      CredentialsArn: !GetAtt APIGatewayInvocationRole.Arn
+      IntegrationMethod: POST
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AddUpdateShoppingCartItemsFunction.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 30000
+
+  #
+  # Delete Shopping Cart Item(s)
+  #
+  DeleteShoppingCartItemsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: MapDatabaseRoles
+    Properties:
+      Description: "Fetches a customer's record"
+      Handler: "software.amazon.dsql.rewards.DeleteShoppingCartItemFunction::handleRequest"
+      Role: !GetAtt ClusterReadWriteRole.Arn
+      Runtime: java21
+      MemorySize: 1024
+      Timeout: 300
+      Environment:
+        Variables:
+          CLUSTER_ENDPOINT: !Ref ClusterEndpoint
+          DB_USERNAME: !Ref ClusterReadWriteUsername
+          DB_NAME: !Ref DatabaseName
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref FunctionCodeJarS3Key
+      Layers:
+        - !Ref LambdaLayer
+
+
+  DeleteShoppingCartItemsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref API
+      ConnectionType: INTERNET
+      CredentialsArn: !GetAtt APIGatewayInvocationRole.Arn
+      IntegrationMethod: POST
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt DeleteShoppingCartItemsFunction.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 30000
+
+  #
+  # Shopping Cart Checkout
+  #
+  ShoppingCartCheckoutFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: MapDatabaseRoles
+    Properties:
+      Description: "Fetches a customer's record"
+      Handler: "software.amazon.dsql.rewards.ShoppingCartCheckoutFunction::handleRequest"
+      Role: !GetAtt ClusterReadWriteRole.Arn
+      Runtime: java21
+      MemorySize: 1024
+      Timeout: 300
+      Environment:
+        Variables:
+          CLUSTER_ENDPOINT: !Ref ClusterEndpoint
+          DB_USERNAME: !Ref ClusterReadWriteUsername
+          DB_NAME: !Ref DatabaseName
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref FunctionCodeJarS3Key
+      Layers:
+        - !Ref LambdaLayer
+
+
+  ShoppingCartCheckoutIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref API
+      ConnectionType: INTERNET
+      CredentialsArn: !GetAtt APIGatewayInvocationRole.Arn
+      IntegrationMethod: POST
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ShoppingCartCheckoutFunction.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 30000
+
+  #
+  # Cognito Setup
+  #
+  UserPool:
+    Type: 'AWS::Cognito::UserPool'
+    UpdateReplacePolicy: Delete
+    Properties:
+      UserPoolName: RewardsUsers
+  
+  UserPoolDomain:
+    Type: 'AWS::Cognito::UserPoolDomain'
+    Properties:
+      Domain: !Sub 'rewards-${AWS::AccountId}'
+      UserPoolId: !Ref UserPool
+
+  UserPoolClient:
+    Type: 'AWS::Cognito::UserPoolClient'
+    DependsOn:
+      - UserPool
+    Properties:
+      UserPoolId: !Ref UserPool
+      AllowedOAuthFlows:
+        - implicit
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - email
+        - openid
+      CallbackURLs:
+        - 'http://localhost'
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      SupportedIdentityProviders:
+        - COGNITO
+    
+  Authorizer:
+    Type: 'AWS::ApiGatewayV2::Authorizer'
+    Properties: 
+      Name: rewards-authorizer
+      ApiId: !Ref API
+      AuthorizerType: JWT
+      IdentitySource: 
+        - '$request.header.Authorization'
+      JwtConfiguration: 
+        Audience: 
+        - !Ref UserPoolClient
+        Issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+      
+
+  #
+  # API Gateway Routes
+  #
+  GetCustomerRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref API      
+      ApiKeyRequired: False
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      RouteKey: "GET /customer"
+      Target: !Sub "integrations/${GetCustomerIntegration}"
+
+  GetCatalogRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref API
+      ApiKeyRequired: False
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      RouteKey: "GET /product"
+      Target: !Sub "integrations/${GetCatalogIntegration}"
+
+  GetCategoryGeneralRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref API
+      ApiKeyRequired: False
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      RouteKey: "GET /category"
+      Target: !Sub "integrations/${GetCatalogIntegration}"
+
+  GetCategoryParamRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref API
+      ApiKeyRequired: False
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      RouteKey: "GET /category/{category}"
+      Target: !Sub "integrations/${GetCatalogIntegration}"
+
+  GetCatalogItemRouteParam:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref API
+      ApiKeyRequired: False
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      RouteKey: "GET /product/{item_id}"
+      Target: !Sub "integrations/${GetCatalogItemIntegration}"
+
+  GetCategoriesRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref API
+      ApiKeyRequired: False
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      RouteKey: "GET /product/categories"
+      Target: !Sub "integrations/${GetCategoriesIntegration}"
+
+  GetPointsBalanceRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref API
+      ApiKeyRequired: False
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      RouteKey: "GET /points"
+      Target: !Sub "integrations/${GetPointsBalanceIntegration}"
+
+  GetPointsTransactionsRouteParam:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref API
+      ApiKeyRequired: False
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      RouteKey: "GET /points/tx"
+      Target: !Sub "integrations/${GetPointsTransactionsIntegration}"
+
+  GetPointsTransactionDetailsRouteParam:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref API
+      ApiKeyRequired: False
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      RouteKey: "GET /points/tx/{tx_id}"
+      Target: !Sub "integrations/${GetPointsTransactionDetailsIntegration}"
+
+  GetShoppingCartItemsRouteParam:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref API
+      ApiKeyRequired: False
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      RouteKey: "GET /cart"
+      Target: !Sub "integrations/${GetShoppingCartItemsIntegration}"
+
+  ShoppingCartCheckoutRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref API
+      ApiKeyRequired: False
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      RouteKey: "POST /cart/checkout"
+      Target: !Sub "integrations/${ShoppingCartCheckoutIntegration}"
+
+  AddShoppingCartItemsRouteParam:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref API
+      ApiKeyRequired: False
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      RouteKey: "POST /cart/item"
+      Target: !Sub "integrations/${AddUpdateShoppingCartItemsIntegration}"
+
+  EmptyShoppingCartRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref API
+      ApiKeyRequired: False
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      RouteKey: "DELETE /cart"
+      Target: !Sub "integrations/${DeleteShoppingCartItemsIntegration}"
+
+  EmptyShoppingCartRoute2:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref API
+      ApiKeyRequired: False
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      RouteKey: "DELETE /cart/item"
+      Target: !Sub "integrations/${DeleteShoppingCartItemsIntegration}"
+
+  RemoveShoppingCartItemRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref API
+      ApiKeyRequired: False
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      RouteKey: "DELETE /cart/item/{item_id}"
+      Target: !Sub "integrations/${DeleteShoppingCartItemsIntegration}"
+
+Outputs:
+  APIEndpoint:
+    Description: "HTTPS endpoint for the reward points API"
+    Value: !GetAtt API.ApiEndpoint
+
+  APIProdEndpoint:
+    Description: "HTTPS endpoint for the deployed stage of the reward points API"
+    Value: !Join ['/', [!GetAtt API.ApiEndpoint, !Ref ProdStage]]
+
+  CognitoUserPoolId:
+    Value: !GetAtt UserPool.UserPoolId
+
+  CognitoUserPoolProviderUrl:
+    Value: !GetAtt UserPool.ProviderURL
+
+  CognitoUserPoolClientId:
+    Value: !Ref UserPoolClient
+
+  CognitoHostedUiUrl:
+    Value: !Sub https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${UserPoolClient}&response_type=token&scope=email+openid&redirect_uri=http://localhost
+
+  CognitoUserPassword:
+    Description: "Password used for all customers in the Aurora DSQL cluster rewards database"
+    Value: !GetAtt RegisterUsers.Password
